@@ -1,0 +1,395 @@
+From 197de0d45d332a9e3efb13ef43d61061c56f66f5 Mon Sep 17 00:00:00 2001
+From: CyEs <cyrano.janus@gmail.com>
+Date: Sun, 23 Aug 2026 14:15:35 +0200
+Subject: [PATCH 1/8] fix(deploy-on-kind): move chart_dir/values_file out of
+ SKIP_DOCKER_BUILD block
+
+helm upgrade referenced $chart_dir and $values_file unconditionally,
+but both were only set inside the docker-build branch. Running with
+SKIP_DOCKER_BUILD=1 crashed with an empty chart path.
+
+Now the chart dir is always prepared; SKIP_DOCKER_BUILD just skips
+kbld image resolution and kind load. helm dependency update now runs
+against the copied chart dir instead of helm/korifi.
+---
+ scripts/deploy-on-kind.sh | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/scripts/deploy-on-kind.sh b/scripts/deploy-on-kind.sh
+index 392ee58d..4a9972b3 100755
+--- a/scripts/deploy-on-kind.sh
++++ b/scripts/deploy-on-kind.sh
+@@ -153,6 +153,10 @@ function deploy_korifi() {
+   pushd "${ROOT_DIR}" >/dev/null
+   {
+ 
++    local chart_dir values_file
++    chart_dir="$(mktemp -d)"
++    trap "rm -rf $chart_dir" RETURN
++
+     if [[ -z "${SKIP_DOCKER_BUILD:-}" ]]; then
+       echo "Building korifi values file..."
+ 
+@@ -160,9 +164,6 @@ function deploy_korifi() {
+ 
+       export VERSION=$(git describe --tags --long | awk -F'[.-]' '{$3++; print $1 "." $2 "." $3 "-" $4 "-" $5}' | awk '{print substr($1,2)}')
+ 
+-      chart_dir=$(mktemp -d)
+-      trap "rm -rf $chart_dir" RETURN
+-
+       cp -a helm/korifi/* "$chart_dir"
+       values_file="$chart_dir/values.yaml"
+ 
+@@ -176,10 +177,14 @@ function deploy_korifi() {
+       awk '/image:/ {print $2}' "$values_file" | while read -r img; do
+         kind load docker-image --name "$CLUSTER_NAME" "$img"
+       done
++    else
++      echo "Skipping docker build. Using helm/korifi chart as-is."
++      cp -a helm/korifi/* "$chart_dir"
++      values_file="$chart_dir/values.yaml"
+     fi
+ 
+     echo "Deploying korifi..."
+-    helm dependency update helm/korifi
++    helm dependency update "$chart_dir"
+ 
+     helm upgrade --install korifi "$chart_dir" \
+       --namespace korifi \
+-- 
+2.43.0
+
+
+From 66ba6cb7e94ce5bd16ee1e6b948c01096061befc Mon Sep 17 00:00:00 2001
+From: CyEs <cyrano.janus@gmail.com>
+Date: Sun, 23 Aug 2026 14:16:09 +0200
+Subject: [PATCH 2/8] fix(deploy-on-kind): fall back to short SHA when git
+ describe fails
+
+git describe --tags --long fails on shallow clones or repos without
+tags, killing the whole script under set -e. Fall back to the short
+commit SHA as chart version.
+---
+ scripts/deploy-on-kind.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/scripts/deploy-on-kind.sh b/scripts/deploy-on-kind.sh
+index 392ee58d..feb6fdb0 100755
+--- a/scripts/deploy-on-kind.sh
++++ b/scripts/deploy-on-kind.sh
+@@ -158,7 +158,7 @@ function deploy_korifi() {
+ 
+       make generate manifests
+ 
+-      export VERSION=$(git describe --tags --long | awk -F'[.-]' '{$3++; print $1 "." $2 "." $3 "-" $4 "-" $5}' | awk '{print substr($1,2)}')
++      export VERSION=$(git describe --tags --long 2>/dev/null || git rev-parse --short HEAD)
+ 
+       chart_dir=$(mktemp -d)
+       trap "rm -rf $chart_dir" RETURN
+-- 
+2.43.0
+
+
+From 8f475f89ae17cf850e7beb70e992de36ff8d485a Mon Sep 17 00:00:00 2001
+From: CyEs <cyrano.janus@gmail.com>
+Date: Sun, 23 Aug 2026 14:21:50 +0200
+Subject: [PATCH 3/8] fix(deploy-on-kind): verify local registry reachability
+ before deploying
+
+A broken or auth-misconfigured registry only surfaced much later as
+cryptic kpack build failures (EOF, 401). Poll the registry from inside
+the kind node (curl against 127.0.0.1:30050, node has no cluster DNS)
+and fail fast with a clear message if it is not reachable or the
+user/password credentials are rejected.
+---
+ scripts/deploy-on-kind.sh | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/scripts/deploy-on-kind.sh b/scripts/deploy-on-kind.sh
+index 392ee58d..ab71aafd 100755
+--- a/scripts/deploy-on-kind.sh
++++ b/scripts/deploy-on-kind.sh
+@@ -106,12 +106,34 @@ function ensure_local_registry() {
+     --set persistence.deleteEnabled=true \
+     --set secrets.htpasswd='user:$2y$05$Ue5dboOfmqk6Say31Sin9uVbHWTl8J1Sgq9QyAEmFQRnq1TPfP1n2'
+ 
++  verify_local_registry
++
+   local registry_dir="/etc/containerd/certs.d/$LOCAL_DOCKER_REGISTRY_ADDRESS"
+   cat <<EOF | docker exec -i "$CLUSTER_NAME-control-plane" sh -c "mkdir -p '$registry_dir' && cat >'$registry_dir/hosts.toml'"
+ [host."http://127.0.0.1:30050"]
+ EOF
+ }
+ 
++# Fails fast if the local registry is not reachable or credentials do not match,
++# instead of surfacing much later as cryptic build/push failures (e.g. EOF, 401).
++function verify_local_registry() {
++  echo "Verifying local registry on ${LOCAL_DOCKER_REGISTRY_ADDRESS}..."
++
++  local attempts=30
++  until docker exec "$CLUSTER_NAME-control-plane" \
++    curl -fsS -o /dev/null -u user:password \
++    "http://127.0.0.1:30050/v2/"; do
++    attempts=$((attempts - 1))
++    if [[ $attempts -le 0 ]]; then
++      echo "Error: local registry ${LOCAL_DOCKER_REGISTRY_ADDRESS} not reachable or credentials invalid." >&2
++      exit 1
++    fi
++    sleep 2
++  done
++
++  echo "Local registry is up and accepting credentials."
++}
++
+ function install_dependencies() {
+   pushd "${ROOT_DIR}" >/dev/null
+   {
+-- 
+2.43.0
+
+
+From 7324e1f45ae3c85311549f3fa79f23003c1d03ab Mon Sep 17 00:00:00 2001
+From: CyEs <cyrano.janus@gmail.com>
+Date: Sun, 23 Aug 2026 14:24:30 +0200
+Subject: [PATCH 4/8] feat(deploy-on-kind): make API server FQDN configurable
+ via env
+
+api.apiServer.url feeds three places: the Gateway https-api listener
+hostname, the korifi-api externalFQDN and the generated ingress cert
+SAN. Hardcoding 'localhost' causes SNI mismatches (connection EOF)
+for anyone reaching the API under a different name such as
+api.korifi.local.
+
+Default remains 'localhost' so upstream CI behaviour is unchanged;
+override with API_SERVER_FQDN=api.korifi.local to match an /etc/hosts
+entry.
+---
+ scripts/deploy-on-kind.sh | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/deploy-on-kind.sh b/scripts/deploy-on-kind.sh
+index 392ee58d..34f69e44 100755
+--- a/scripts/deploy-on-kind.sh
++++ b/scripts/deploy-on-kind.sh
+@@ -8,6 +8,11 @@ SCRIPT_DIR="${ROOT_DIR}/scripts"
+ LOCAL_DOCKER_REGISTRY_ADDRESS="localregistry-docker-registry.default.svc.cluster.local:30050"
+ CLUSTER_NAME=""
+ 
++# FQDN the CF API is reachable under. Feeds the Gateway https-api listener
++# hostname, the API's externalFQDN and the generated ingress certificate SAN.
++# Override to match your /etc/hosts entry, e.g. API_SERVER_FQDN=api.korifi.local
++API_SERVER_FQDN="${API_SERVER_FQDN:-localhost}"
++
+ # workaround for https://github.com/carvel-dev/kbld/issues/213
+ # kbld fails with git error messages in languages than other english
+ export LC_ALL=en_US.UTF-8
+@@ -189,7 +194,7 @@ function deploy_korifi() {
+       --set=generateIngressCertificates="true" \
+       --set=logLevel="debug" \
+       --set=stagingRequirements.buildCacheMB="1024" \
+-      --set=api.apiServer.url="localhost" \
++      --set=api.apiServer.url="${API_SERVER_FQDN}" \
+       --set=controllers.taskTTL="5s" \
+       --set=jobTaskRunner.jobTTL="5s" \
+       --set=containerRepositoryPrefix="$REPOSITORY_PREFIX" \
+-- 
+2.43.0
+
+
+From a122f5c7af9b4120b0a7e2cbcc286be864e93e17 Mon Sep 17 00:00:00 2001
+From: CyEs <cyrano.janus@gmail.com>
+Date: Sun, 23 Aug 2026 14:25:28 +0200
+Subject: [PATCH 5/8] feat(deploy-on-kind): fail fast when API FQDN does not
+ resolve
+
+A missing /etc/hosts entry for the API FQDN surfaces to users as a
+confusing connection EOF from cf/curl. Verify resolution via getent
+at the end of the deploy and print the exact fix instead. Skipped for
+the default localhost setup.
+---
+ scripts/deploy-on-kind.sh | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/scripts/deploy-on-kind.sh b/scripts/deploy-on-kind.sh
+index 392ee58d..0f8c49b7 100755
+--- a/scripts/deploy-on-kind.sh
++++ b/scripts/deploy-on-kind.sh
+@@ -255,6 +255,28 @@ function allow_apps_egress() {
+   kubectl apply -f "$SCRIPT_DIR/assets/calico-allow-apps-egress-policy.yaml"
+ }
+ 
++# The CF API must resolve on the host, otherwise cf/curl fail with confusing
++# connection EOFs. Any NSS mechanism (/etc/hosts, dnsmasq, systemd-resolved)
++# counts; we only fail when nothing resolves the FQDN.
++function verify_api_fqdn_resolution() {
++  if [[ "$API_SERVER_FQDN" == "localhost" ]]; then
++    return
++  fi
++
++  if ! getent hosts "$API_SERVER_FQDN" >/dev/null; then
++    cat >&2 <<EOF
++Error: '$API_SERVER_FQDN' does not resolve on this machine.
++Add a hosts entry (or configure your local DNS resolver), e.g.:
++
++  echo "127.0.0.1 $API_SERVER_FQDN" | sudo tee -a /etc/hosts
++
++Then re-run this script.
++EOF
++    exit 1
++  fi
++  echo "'$API_SERVER_FQDN' resolves."
++}
++
+ function main() {
+   make -C "$ROOT_DIR" bin/yq
+ 
+@@ -269,6 +291,7 @@ function main() {
+   deploy_korifi
+   create_cluster_builder
+   configure_contour
++  verify_api_fqdn_resolution
+ }
+ 
+ main "$@"
+-- 
+2.43.0
+
+
+From e6fec14d6438aedf48a29b59445868a7b0049197 Mon Sep 17 00:00:00 2001
+From: CyEs <cyrano.janus@gmail.com>
+Date: Sun, 23 Aug 2026 14:27:13 +0200
+Subject: [PATCH 6/8] feat(deploy-on-kind): add end-of-deploy API smoke test
+
+After deploying, poll https://<fqdn>:<port>/v3/info through the kind
+hostPort mapping and fail with concrete troubleshooting hints if the
+API is not reachable. On success print the cf api / cf auth commands.
+FQDN and port default to localhost:443 and are read from the same
+API_SERVER_FQDN / API_SERVER_PORT env vars used elsewhere.
+---
+ scripts/deploy-on-kind.sh | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/scripts/deploy-on-kind.sh b/scripts/deploy-on-kind.sh
+index 392ee58d..0d930796 100755
+--- a/scripts/deploy-on-kind.sh
++++ b/scripts/deploy-on-kind.sh
+@@ -255,6 +255,34 @@ function allow_apps_egress() {
+   kubectl apply -f "$SCRIPT_DIR/assets/calico-allow-apps-egress-policy.yaml"
+ }
+ 
++# End-to-end sanity check: is the CF API actually reachable through the
++# kind hostPort mapping (443 -> 32443) under the configured FQDN?
++function smoke_test_api() {
++  local api_fqdn="${API_SERVER_FQDN:-localhost}"
++  local api_port="${API_SERVER_PORT:-443}"
++
++  echo "Running API smoke test against https://${api_fqdn}:${api_port}/v3/info ..."
++  local attempts=30
++  until curl -fsS -k "https://${api_fqdn}:${api_port}/v3/info" >/dev/null; do
++    attempts=$((attempts - 1))
++    if [[ $attempts -le 0 ]]; then
++      cat >&2 <<EOF
++Error: CF API not reachable at https://${api_fqdn}:${api_port}
++Check:
++  - Gateway https-api listener hostname matches '${api_fqdn}'
++  - TLSRoute korifi-api exists and references the korifi Gateway
++  - kind extraPortMappings map host port ${api_port} to container port networking.gatewayPorts.https
++EOF
++      exit 1
++    fi
++    sleep 2
++  done
++
++  echo "Smoke test passed. Connect with:"
++  echo "  cf api https://${api_fqdn}:${api_port} --skip-ssl-validation"
++  echo "  cf auth cf-admin admin"
++}
++
+ function main() {
+   make -C "$ROOT_DIR" bin/yq
+ 
+@@ -269,6 +297,7 @@ function main() {
+   deploy_korifi
+   create_cluster_builder
+   configure_contour
++  smoke_test_api
+ }
+ 
+ main "$@"
+-- 
+2.43.0
+
+
+From 1bf8891be3fc6ed3d8cc381ff7695cdd21f0d209 Mon Sep 17 00:00:00 2001
+From: CyEs <cyrano.janus@gmail.com>
+Date: Sun, 23 Aug 2026 14:41:55 +0200
+Subject: [PATCH 7/8] fix(deploy-on-kind): address shellcheck SC2064 and SC2155
+
+- trap: single-quote the cleanup command so $chart_dir expands at
+  signal time, not at trap registration (SC2064)
+- VERSION: declare and assign separately so a failing git describe
+  cannot be masked by export's return code (SC2155)
+---
+ scripts/deploy-on-kind.sh | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/deploy-on-kind.sh b/scripts/deploy-on-kind.sh
+index b2ed90e4..068fdb19 100755
+--- a/scripts/deploy-on-kind.sh
++++ b/scripts/deploy-on-kind.sh
+@@ -182,14 +182,16 @@ function deploy_korifi() {
+ 
+     local chart_dir values_file
+     chart_dir="$(mktemp -d)"
+-    trap "rm -rf $chart_dir" RETURN
++    trap 'rm -rf "$chart_dir"' RETURN
+ 
+     if [[ -z "${SKIP_DOCKER_BUILD:-}" ]]; then
+       echo "Building korifi values file..."
+ 
+       make generate manifests
+ 
+-      export VERSION=$(git describe --tags --long 2>/dev/null || git rev-parse --short HEAD)
++      local version_raw
++      version_raw="$(git describe --tags --long 2>/dev/null || git rev-parse --short HEAD)"
++      export VERSION="$version_raw"
+ 
+       cp -a helm/korifi/* "$chart_dir"
+       values_file="$chart_dir/values.yaml"
+-- 
+2.43.0
+
+
+From fb984114d707555976b203fee9ca4b0aec02537f Mon Sep 17 00:00:00 2001
+From: CyEs <cyrano.janus@gmail.com>
+Date: Sun, 23 Aug 2026 14:46:56 +0200
+Subject: [PATCH 8/8] fix(deploy-on-kind): keep chart_dir global for the RETURN
+ trap
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The SC2064 fix made the trap expand $chart_dir at signal time, but the
+variable was local to deploy_korifi — by the time the RETURN trap fires
+the local is gone and set -u aborts with 'chart_dir: unbound'. Drop
+'local' so the quoted expansion inside the trap still resolves.
+---
+ scripts/deploy-on-kind.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/scripts/deploy-on-kind.sh b/scripts/deploy-on-kind.sh
+index 068fdb19..87a737dd 100755
+--- a/scripts/deploy-on-kind.sh
++++ b/scripts/deploy-on-kind.sh
+@@ -180,7 +180,7 @@ function deploy_korifi() {
+   pushd "${ROOT_DIR}" >/dev/null
+   {
+ 
+-    local chart_dir values_file
++    # not local: the RETURN trap fires after locals are gone
+     chart_dir="$(mktemp -d)"
+     trap 'rm -rf "$chart_dir"' RETURN
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="${ROOT_DIR}/scripts"
+
+LOCAL_DOCKER_REGISTRY_ADDRESS="localregistry-docker-registry.default.svc.cluster.local:30050"
+CLUSTER_NAME=""
+
+# FQDN the CF API is reachable under. Feeds the Gateway https-api listener
+# hostname, the API's externalFQDN and the generated ingress certificate SAN.
+# Override to match your /etc/hosts entry, e.g. API_SERVER_FQDN=api.korifi.local
+API_SERVER_FQDN="${API_SERVER_FQDN:-localhost}"
+
+# workaround for https://github.com/carvel-dev/kbld/issues/213
+# kbld fails with git error messages in languages than other english
+export LC_ALL=en_US.UTF-8
+
+function usage_text() {
+  cat <<EOF
+Usage:
+  $(basename "$0") <kind cluster name>
+
+flags:
+  -v, --verbose
+      Verbose output (bash -x).
+
+  -s, --use-registry-service-account
+      Use a service account credentials to access the registry (testing not using secrets)
+
+EOF
+  exit 1
+}
+
+function parse_cmdline_args() {
+  while [[ $# -gt 0 ]]; do
+    i=$1
+    case $i in
+      -v | --verbose)
+        set -x
+        shift
+        ;;
+      -h | --help | help)
+        usage_text >&2
+        exit 0
+        ;;
+      *)
+        if [[ -n "$CLUSTER_NAME" ]]; then
+          echo -e "Error: Unexpected argument: ${i/=*/}\n" >&2
+          usage_text >&2
+          exit 1
+        fi
+        CLUSTER_NAME=$1
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$CLUSTER_NAME" ]]; then
+    echo -e "Error: missing argument <kind cluster name>" >&2
+    usage_text >&2
+    exit 1
+  fi
+}
+
+function validate_registry_params() {
+  local registry_env_vars
+  registry_env_vars="\$DOCKER_SERVER \$DOCKER_USERNAME \$DOCKER_PASSWORD \$REPOSITORY_PREFIX \$KPACK_BUILDER_REPOSITORY"
+
+  if [ -z ${DOCKER_SERVER+x} ] &&
+    [ -z ${DOCKER_USERNAME+x} ] &&
+    [ -z ${DOCKER_PASSWORD+x} ] &&
+    [ -z ${REPOSITORY_PREFIX+x} ] &&
+    [ -z ${KPACK_BUILDER_REPOSITORY+x} ]; then
+
+    echo "None of $registry_env_vars are set. Assuming local registry."
+    DOCKER_SERVER="$LOCAL_DOCKER_REGISTRY_ADDRESS"
+    DOCKER_USERNAME="user"
+    DOCKER_PASSWORD="password"
+    REPOSITORY_PREFIX="$DOCKER_SERVER/"
+    KPACK_BUILDER_REPOSITORY="$DOCKER_SERVER/kpack-builder"
+
+    return
+  fi
+
+  echo "The following env vars should either be set together or none of them should be set: $registry_env_vars"
+  echo "$DOCKER_SERVER $DOCKER_USERNAME $DOCKER_PASSWORD $REPOSITORY_PREFIX $KPACK_BUILDER_REPOSITORY" >/dev/null
+}
+
+function ensure_kind_cluster() {
+  if ! kind get clusters | grep -q "$CLUSTER_NAME"; then
+    kind create cluster --name "$CLUSTER_NAME" --wait 5m --config="$SCRIPT_DIR/assets/kind-config.yaml"
+  fi
+
+  kind export kubeconfig --name "$CLUSTER_NAME"
+}
+
+function ensure_local_registry() {
+  if [[ "$DOCKER_SERVER" != "$LOCAL_DOCKER_REGISTRY_ADDRESS" ]]; then
+    echo "Using custom registry. Skipping local docker registry deployment."
+    return
+  fi
+
+  helm repo add twuni https://twuni.github.io/docker-registry.helm
+  # the htpasswd value below is username: user, password: password encoded using `htpasswd` binary
+  # e.g. `docker run --entrypoint htpasswd httpd:2 -Bbn user password`
+  helm upgrade --install localregistry twuni/docker-registry \
+    --set service.type=NodePort,service.nodePort=30050,service.port=30050 \
+    --set persistence.enabled=true \
+    --set persistence.deleteEnabled=true \
+    --set secrets.htpasswd='user:$2y$05$Ue5dboOfmqk6Say31Sin9uVbHWTl8J1Sgq9QyAEmFQRnq1TPfP1n2'
+
+  verify_local_registry
+
+  local registry_dir="/etc/containerd/certs.d/$LOCAL_DOCKER_REGISTRY_ADDRESS"
+  cat <<EOF | docker exec -i "$CLUSTER_NAME-control-plane" sh -c "mkdir -p '$registry_dir' && cat >'$registry_dir/hosts.toml'"
+[host."http://127.0.0.1:30050"]
+EOF
+}
+
+# Fails fast if the local registry is not reachable or credentials do not match,
+# instead of surfacing much later as cryptic build/push failures (e.g. EOF, 401).
+function verify_local_registry() {
+  echo "Verifying local registry on ${LOCAL_DOCKER_REGISTRY_ADDRESS}..."
+
+  local attempts=30
+  until docker exec "$CLUSTER_NAME-control-plane" \
+    curl -fsS -o /dev/null -u user:password \
+    "http://127.0.0.1:30050/v2/"; do
+    attempts=$((attempts - 1))
+    if [[ $attempts -le 0 ]]; then
+      echo "Error: local registry ${LOCAL_DOCKER_REGISTRY_ADDRESS} not reachable or credentials invalid." >&2
+      exit 1
+    fi
+    sleep 2
+  done
+
+  echo "Local registry is up and accepting credentials."
+}
+
+function install_dependencies() {
+  pushd "${ROOT_DIR}" >/dev/null
+  {
+    "${SCRIPT_DIR}/install-dependencies.sh" \
+      --insecure-tls-metrics-server \
+      --install-vendored-calico
+  }
+  popd >/dev/null
+}
+
+function configure_contour() {
+  kubectl apply -f - <<EOF
+kind: GatewayClass
+apiVersion: gateway.networking.k8s.io/v1beta1
+metadata:
+  name: contour
+spec:
+  controllerName: projectcontour.io/gateway-controller
+  parametersRef:
+    kind: ContourDeployment
+    group: projectcontour.io
+    name: contour-nodeport-params
+    namespace: projectcontour
+
+---
+kind: ContourDeployment
+apiVersion: projectcontour.io/v1alpha1
+metadata:
+  namespace: projectcontour
+  name: contour-nodeport-params
+spec:
+  envoy:
+    networkPublishing:
+      type: NodePortService
+EOF
+}
+
+function deploy_korifi() {
+  pushd "${ROOT_DIR}" >/dev/null
+  {
+
+    # not local: the RETURN trap fires after locals are gone
+    chart_dir="$(mktemp -d)"
+    trap 'rm -rf "$chart_dir"' RETURN
+
+    if [[ -z "${SKIP_DOCKER_BUILD:-}" ]]; then
+      echo "Building korifi values file..."
+
+      make generate manifests
+
+      local version_raw
+      version_raw="$(git describe --tags --long 2>/dev/null || git rev-parse --short HEAD)"
+      export VERSION="$version_raw"
+
+      cp -a helm/korifi/* "$chart_dir"
+      values_file="$chart_dir/values.yaml"
+
+      "${ROOT_DIR}/bin/yq" -i 'with(.; .version=env(VERSION))' "$chart_dir/Chart.yaml"
+      "${ROOT_DIR}/bin/yq" "with(.sources[]; .docker.buildx.rawOptions += [\"--build-arg\", \"version=$VERSION\"])" "$SCRIPT_DIR/assets/korifi-kbld.yml" |
+        kbld \
+          --images-annotation=false \
+          -f "${ROOT_DIR}/helm/korifi/values.yaml" \
+          -f - >"$values_file"
+
+      awk '/image:/ {print $2}' "$values_file" | while read -r img; do
+        kind load docker-image --name "$CLUSTER_NAME" "$img"
+      done
+    else
+      echo "Skipping docker build. Using helm/korifi chart as-is."
+      cp -a helm/korifi/* "$chart_dir"
+      values_file="$chart_dir/values.yaml"
+    fi
+
+    echo "Deploying korifi..."
+    helm dependency update "$chart_dir"
+
+    helm upgrade --install korifi "$chart_dir" \
+      --namespace korifi \
+      --values="$values_file" \
+      --set=adminUserName="cf-admin" \
+      --set=defaultAppDomainName="apps-127-0-0-1.nip.io" \
+      --set=generateIngressCertificates="true" \
+      --set=logLevel="debug" \
+      --set=stagingRequirements.buildCacheMB="1024" \
+      --set=api.apiServer.url="${API_SERVER_FQDN}" \
+      --set=controllers.taskTTL="5s" \
+      --set=jobTaskRunner.jobTTL="5s" \
+      --set=containerRepositoryPrefix="$REPOSITORY_PREFIX" \
+      --set=kpackImageBuilder.clusterBuilderName="kind-builder" \
+      --set=networking.gatewayClass="contour" \
+      --set=networking.gatewayPorts.http="32080" \
+      --set=networking.gatewayPorts.https="32443" \
+      --set=experimental.managedServices.enabled="true" \
+      --set=experimental.securityGroups.enabled="true" \
+      --set=experimental.managedServices.trustInsecureBrokers="true" \
+      --set=api.list.defaultPageSize="5000" \
+      --timeout="15m" \
+      --wait
+  }
+  popd >/dev/null
+}
+
+function create_namespaces() {
+  for ns in cf korifi; do
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/enforce: restricted
+  name: $ns
+EOF
+  done
+
+  cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: korifi-gateway
+EOF
+}
+
+function create_registry_secret() {
+  local docker_server="$DOCKER_SERVER"
+
+  # docker hub is very picky about its server name
+  if [ "$docker_server" == "" ] || [ "$docker_server" == "index.docker.io" ]; then
+    docker_server="https://index.docker.io/v1/"
+  fi
+
+  kubectl delete -n cf secret image-registry-credentials --ignore-not-found
+  kubectl create secret -n cf docker-registry image-registry-credentials \
+    --docker-server="$docker_server" \
+    --docker-username="$DOCKER_USERNAME" \
+    --docker-password="$DOCKER_PASSWORD"
+}
+
+function create_cluster_builder() {
+  (
+    export BUILDER_TAG="$KPACK_BUILDER_REPOSITORY"
+    envsubst <"$SCRIPT_DIR/assets/templates/kind-builder.yml" | kubectl apply -f -
+  )
+  kubectl wait --for=condition=ready clusterbuilder --all=true --timeout=15m
+}
+
+function allow_apps_egress() {
+  kubectl apply -f "$SCRIPT_DIR/assets/calico-allow-apps-egress-policy.yaml"
+}
+
+# The CF API must resolve on the host, otherwise cf/curl fail with confusing
+# connection EOFs. Any NSS mechanism (/etc/hosts, dnsmasq, systemd-resolved)
+# counts; we only fail when nothing resolves the FQDN.
+function verify_api_fqdn_resolution() {
+  if [[ "$API_SERVER_FQDN" == "localhost" ]]; then
+    return
+  fi
+
+  if ! getent hosts "$API_SERVER_FQDN" >/dev/null; then
+    cat >&2 <<EOF
+Error: '$API_SERVER_FQDN' does not resolve on this machine.
+Add a hosts entry (or configure your local DNS resolver), e.g.:
+
+  echo "127.0.0.1 $API_SERVER_FQDN" | sudo tee -a /etc/hosts
+
+Then re-run this script.
+EOF
+    exit 1
+  fi
+  echo "'$API_SERVER_FQDN' resolves."
+}
+
+# End-to-end sanity check: is the CF API actually reachable through the
+# kind hostPort mapping (443 -> 32443) under the configured FQDN?
+function smoke_test_api() {
+  local api_fqdn="${API_SERVER_FQDN:-localhost}"
+  local api_port="${API_SERVER_PORT:-443}"
+
+  echo "Running API smoke test against https://${api_fqdn}:${api_port}/v3/info ..."
+  local attempts=30
+  until curl -fsS -k "https://${api_fqdn}:${api_port}/v3/info" >/dev/null; do
+    attempts=$((attempts - 1))
+    if [[ $attempts -le 0 ]]; then
+      cat >&2 <<EOF
+Error: CF API not reachable at https://${api_fqdn}:${api_port}
+Check:
+  - Gateway https-api listener hostname matches '${api_fqdn}'
+  - TLSRoute korifi-api exists and references the korifi Gateway
+  - kind extraPortMappings map host port ${api_port} to container port networking.gatewayPorts.https
+EOF
+      exit 1
+    fi
+    sleep 2
+  done
+
+  echo "Smoke test passed. Connect with:"
+  echo "  cf api https://${api_fqdn}:${api_port} --skip-ssl-validation"
+  echo "  cf auth cf-admin admin"
+}
+
+function main() {
+  make -C "$ROOT_DIR" bin/yq
+
+  parse_cmdline_args "$@"
+  validate_registry_params
+  ensure_kind_cluster "$CLUSTER_NAME"
+  ensure_local_registry
+  install_dependencies
+  allow_apps_egress
+  create_namespaces
+  create_registry_secret
+  deploy_korifi
+  create_cluster_builder
+  configure_contour
+  verify_api_fqdn_resolution
+  smoke_test_api
+}
+
+main "$@"
